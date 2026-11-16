@@ -1,0 +1,67 @@
+# ==========================================
+# 🔐 Security Surveillance Project .gitignore
+# ==========================================
+
+# Recorded Video Clips & Thumbnails (Do not commit surveillance footage)
+clips/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*_thumb.jpg
+*_raw.mp4
+
+# SQLite Database & Local Data
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+burglar.db
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.Python
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Anaconda & Conda
+.conda/
+conda-meta/
+
+# Streamlit config & secrets
+.streamlit/secrets.toml
+
+# Distribution / Packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System specific files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.Spotlight-V100
+.Trashes
+
+# Logs & temporary files
+*.log
+tmp/
+temp/
