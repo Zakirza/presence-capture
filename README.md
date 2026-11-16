@@ -164,7 +164,7 @@ burgler presence/
 ### Requirements
 * **Operating System**: Windows 10/11, Linux, or macOS
 * **Python**: Python 3.10 to 3.12 (Anaconda or standard Python)
-* **Camera**: Integrated webcam or USB external camera
+* **Camera**: Integrated webcam, external USB camera, or RTSP IP Camera / CCTV / NVR stream
 
 ### Setup Instructions
 
@@ -205,7 +205,9 @@ Once started, open your web browser at:
 ## 🖥️ User Interface Guide
 
 ### Sidebar Controls
-* **📷 Camera**: Select input device index (`0` for built-in webcam, `1` or `2` for external USB cameras).
+* **📡 Input Source**:
+  * **Local Webcam**: Select input device index (`0` for built-in webcam, `1` or `2` for external USB cameras).
+  * **RTSP Stream**: Enter an IP camera / CCTV / NVR stream URL (e.g. `rtsp://admin:password@192.168.1.100:554/stream1`).
 * **🎚️ Sensitivity (1–10)**: Adjusts detection threshold. Higher numbers detect subtle movements.
 * **📐 Min Motion Area (px²)**: Minimum pixel cluster size required to trigger an event (filters out small pets, shadows, or insects).
 * **▶️ Start / ⏹️ Stop**: Starts or halts the background camera monitoring thread.

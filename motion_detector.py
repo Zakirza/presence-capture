@@ -121,17 +121,41 @@ def _record_clip(cap, base_name: str, fps: float, width: int, height: int,
 
 # ── Main detector loop ────────────────────────────────────────────────────────
 
-def _detector_loop(camera_index: int, min_area: int, sensitivity: int):
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+def _detector_loop(camera_source: int | str, min_area: int, sensitivity: int):
+    # Enforce TCP transport for RTSP streams to avoid packet drops / frame corruption
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+    is_network_stream = isinstance(camera_source, str) and (
+        camera_source.startswith("rtsp://") or 
+        camera_source.startswith("http://") or 
+        camera_source.startswith("https://")
+    )
+
+    if is_network_stream:
+        cap = cv2.VideoCapture(camera_source)
+    else:
+        try:
+            cam_idx = int(camera_source)
+        except (ValueError, TypeError):
+            cam_idx = 0
+        cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+
     if not cap.isOpened():
         with state["lock"]:
-            state["error"]   = f"Cannot open camera index {camera_index}."
+            state["error"]   = f"Cannot open camera source: {camera_source}"
             state["running"] = False
         return
 
-    fps    = cap.get(cv2.CAP_PROP_FPS) or 20.0
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Warm-up / read sample frame to guarantee valid frame dimensions
+    ok, test_frame = cap.read()
+    if ok and test_frame is not None:
+        height, width = test_frame.shape[:2]
+    else:
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+
+    raw_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = raw_fps if (raw_fps and raw_fps > 0 and not np.isnan(raw_fps)) else 20.0
 
     var_threshold = max(10, 110 - sensitivity * 10)   # sensitivity 1–10
     bg_sub = cv2.createBackgroundSubtractorMOG2(
@@ -198,7 +222,7 @@ def _detector_loop(camera_index: int, min_area: int, sensitivity: int):
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def start(camera_index: int = 0, min_area: int = 1500, sensitivity: int = 5):
+def start(camera_source: int | str = 0, min_area: int = 1500, sensitivity: int = 5):
     global _thread
     with state["lock"]:
         if state["running"]:
@@ -208,7 +232,7 @@ def start(camera_index: int = 0, min_area: int = 1500, sensitivity: int = 5):
 
     _thread = threading.Thread(
         target=_detector_loop,
-        args=(camera_index, min_area, sensitivity),
+        args=(camera_source, min_area, sensitivity),
         daemon=True,
     )
     _thread.start()

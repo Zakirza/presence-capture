@@ -28,21 +28,34 @@ with st.sidebar:
     st.title("🔐 Burglar Detector")
     st.markdown("---")
 
-    camera_index = st.selectbox("📷 Camera", [0, 1, 2], index=0,
-                                help="0 = built-in webcam, 1/2 = external")
-    sensitivity  = st.slider("🎚️ Sensitivity", 1, 10, 5,
-                             help="Higher = detects smaller movements")
-    min_area     = st.slider("📐 Min Motion Area (px²)", 500, 5000, 1500, step=100,
-                             help="Minimum contour area to count as motion")
+    source_type = st.radio("📡 Input Source", ["Local Webcam", "RTSP Stream"], horizontal=True)
+
+    if source_type == "Local Webcam":
+        camera_source = st.selectbox(
+            "📷 Select Camera Index",
+            [0, 1, 2],
+            index=0,
+            help="0 = built-in webcam, 1 or 2 = external USB camera"
+        )
+    else:
+        camera_source = st.text_input(
+            "🌐 RTSP URL",
+            value="rtsp://admin:password@192.168.1.100:554/stream1",
+            help="RTSP URL for your IP Camera, CCTV, or NVR"
+        )
+
+    sensitivity = st.slider("🎚️ Sensitivity", 1, 10, 5,
+                            help="Higher = detects smaller movements")
+    min_area    = st.slider("📐 Min Motion Area (px²)", 500, 5000, 1500, step=100,
+                            help="Minimum contour area to count as motion")
 
     st.markdown("---")
     col1, col2 = st.columns(2)
     start_btn  = col1.button("▶️ Start", use_container_width=True, type="primary")
     stop_btn   = col2.button("⏹️ Stop",  use_container_width=True)
 
-
     if start_btn:
-        md.start(camera_index=camera_index, min_area=min_area, sensitivity=sensitivity)
+        md.start(camera_source=camera_source, min_area=min_area, sensitivity=sensitivity)
         st.success("Detector started!")
 
     if stop_btn:
