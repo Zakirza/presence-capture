@@ -1,5 +1,5 @@
 """
-app.py — Streamlit frontend for the Burglar Presence Detection System
+app.py — Streamlit frontend for RTSP Video Streamer and Retriever
 Run with:  streamlit run app.py
 """
 
@@ -14,8 +14,8 @@ import motion_detector as md
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Burglar Presence Detection",
-    page_icon="🔐",
+    page_title="RTSP Video Streamer and Retriever",
+    page_icon="📹",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -23,62 +23,71 @@ st.set_page_config(
 # ── Init DB ───────────────────────────────────────────────────────────────────
 db.init_db()
 
-# ── Sidebar — Settings ────────────────────────────────────────────────────────
+# ── Read current background state ─────────────────────────────────────────────
+with md.state["lock"]:
+    is_running   = md.state["running"]
+    is_recording = md.state["recording"]
+    start_time   = md.state["start_time"]
+    err          = md.state["error"]
+    last_saved   = md.state["last_saved_info"]
+
+# ── Sidebar — Controls & Settings ─────────────────────────────────────────────
 with st.sidebar:
-    st.title("🔐 Burglar Detector")
+    st.title("📹 RTSP Streamer & Retriever")
     st.markdown("---")
 
-    source_type = st.radio("📡 Input Source", ["Local Webcam", "RTSP Stream"], horizontal=True)
+    source_type = st.radio("📡 Input Source", ["Local Webcam", "RTSP Stream"], horizontal=True, disabled=is_running)
 
     if source_type == "Local Webcam":
         camera_source = st.selectbox(
             "📷 Select Camera Index",
             [0, 1, 2],
             index=0,
+            disabled=is_running,
             help="0 = built-in webcam, 1 or 2 = external USB camera"
         )
     else:
         camera_source = st.text_input(
             "🌐 RTSP URL",
             value="rtsp://admin:password@192.168.1.100:554/stream1",
+            disabled=is_running,
             help="RTSP URL for your IP Camera, CCTV, or NVR"
         )
 
-    sensitivity = st.slider("🎚️ Sensitivity", 1, 10, 5,
-                            help="Higher = detects smaller movements")
-    min_area    = st.slider("📐 Min Motion Area (px²)", 500, 5000, 1500, step=100,
-                            help="Minimum contour area to count as motion")
-
     st.markdown("---")
+    st.markdown("### 🎬 Recording Controls")
     col1, col2 = st.columns(2)
-    start_btn  = col1.button("▶️ Start", use_container_width=True, type="primary")
-    stop_btn   = col2.button("⏹️ Stop",  use_container_width=True)
+    start_btn  = col1.button("▶️ Start", use_container_width=True, type="primary", disabled=is_running)
+    stop_btn   = col2.button("⏹️ Stop",  use_container_width=True, disabled=not is_running)
 
     if start_btn:
-        md.start(camera_source=camera_source, min_area=min_area, sensitivity=sensitivity)
-        st.success("Detector started!")
+        md.start(camera_source=camera_source)
+        st.rerun()
 
     if stop_btn:
-        md.stop()
-        st.warning("Detector stopped.")
+        with st.spinner("💾 Finalizing and saving recorded clip..."):
+            md.stop(wait=True)
+        st.rerun()
 
     st.markdown("---")
 
     # Status indicators
-    with md.state["lock"]:
-        is_running   = md.state["running"]
-        is_motion    = md.state["motion"]
-        is_recording = md.state["recording"]
-        err          = md.state["error"]
+    st.markdown("### 📊 Status")
+    if is_running and is_recording:
+        elapsed = max(0, int(time.time() - start_time)) if start_time else 0
+        mins, secs = divmod(elapsed, 60)
+        st.error(f"🔴 **Recording...** ({mins:02d}:{secs:02d})")
+    elif is_running:
+        st.warning("🟡 Initializing stream...")
+    else:
+        st.info("⚪ **Idle / Ready**")
 
-    st.markdown("### Status")
-    st.markdown(f"{'🟢 Running' if is_running else '🔴 Stopped'}")
-    if is_motion:
-        st.warning("🚨 Motion Detected!")
-    if is_recording:
-        st.error("🔴 Recording...")
+    if last_saved:
+        size_mb = last_saved['size_kb'] / 1024
+        st.success(f"💾 **Saved:** `{last_saved['file_name']}`\n\n⏱️ {last_saved['duration']}s · 📦 {size_mb:.1f} MB")
+
     if err:
-        st.error(f"Error: {err}")
+        st.error(f"⚠️ {err}")
 
     clip_count = db.get_clip_count()
     day_count  = db.get_day_count()
@@ -89,58 +98,55 @@ with st.sidebar:
 
 
 # ── Main area ─────────────────────────────────────────────────────────────────
-st.title("🔐 Burglar Presence Detection System")
+st.title("📹 RTSP Video Streamer and Retriever")
 
-tab_live, tab_clips = st.tabs(["📡 Live Camera", "📁 Saved Clips"])
+tab_live, tab_clips = st.tabs(["📡 Live Stream", "📁 Saved Clips"])
 
 # ═══════════════════════════════════════════════════════════
-# TAB 1 — Live Camera Feed
+# TAB 1 — Live Stream Feed & Recording Monitor
 # ═══════════════════════════════════════════════════════════
 with tab_live:
-
     with md.state["lock"]:
-        running = md.state["running"]
+        running    = md.state["running"]
+        recording  = md.state["recording"]
+        start_time = md.state["start_time"]
 
     if not running:
-        st.info("👆 Press **▶️ Start** in the sidebar to begin monitoring.")
+        st.info("👆 Select your source in the sidebar and click **▶️ Start** to begin streaming and recording.")
     else:
-        feed_placeholder  = st.empty()
+        elapsed = max(0, int(time.time() - start_time)) if start_time else 0
+        mins, secs = divmod(elapsed, 60)
+
         badge_placeholder = st.empty()
+        badge_placeholder.error(f"🔴 RECORDING IN PROGRESS &nbsp;·&nbsp; ⏱️ Elapsed: {mins:02d}:{secs:02d}")
 
-        # Motion / recording badge
-        with md.state["lock"]:
-            motion    = md.state["motion"]
-            recording = md.state["recording"]
-
-        if recording:
-            badge_placeholder.error("🔴 RECORDING CLIP...")
-        elif motion:
-            badge_placeholder.warning("🚨 MOTION DETECTED")
-        else:
-            badge_placeholder.success("✅ All clear — monitoring")
-
-        # Live frame
+        feed_placeholder = st.empty()
         frame_bytes = md.get_frame_jpeg()
         if frame_bytes:
             feed_placeholder.image(frame_bytes, channels="BGR",
-                                   caption="Live Feed", use_column_width=True)
+                                   caption="Live Feed (RTSP / Camera)", use_column_width=True)
         else:
-            feed_placeholder.info("Waiting for camera frame...")
+            feed_placeholder.info("Connecting to stream...")
 
-        # Auto-refresh every second
+        # Auto-refresh every second while active
         time.sleep(1)
         st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════
-# TAB 2 — Saved Clips
+# TAB 2 — Saved Clips & Retrieval Gallery
 # ═══════════════════════════════════════════════════════════
 with tab_clips:
+    col_head, col_ref = st.columns([5, 1])
+    col_head.subheader("📁 Saved Video Archive")
+    with col_ref:
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
 
     clips_by_day = db.get_clips_by_day()   # dict: {date_str: [clips]}
 
     if not clips_by_day:
-        st.info("No clips saved yet. Motion needs to be detected first.")
+        st.info("No clips recorded yet. Click **▶️ Start** in the sidebar to record your first clip.")
     else:
         total_clips = db.get_clip_count()
         day_count   = db.get_day_count()
@@ -184,7 +190,7 @@ with tab_clips:
                         st.success(f"Deleted: {clip['file_name']}")
                         st.rerun()
 
-                    # Toggle video player via session_state (no nested expander)
+                    # Toggle video player via session_state
                     play_key = f"play_{clip['clip_id']}"
                     if play_key not in st.session_state:
                         st.session_state[play_key] = False
@@ -193,33 +199,10 @@ with tab_clips:
                         st.session_state[play_key] = not st.session_state[play_key]
 
                     if st.session_state[play_key]:
-                        if os.path.exists(clip["file_path"]):
-                            # Ensure file is H.264 web-compatible
-                            file_to_play = clip["file_path"]
-                            try:
-                                import imageio_ffmpeg, subprocess
-                                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-                                converted_path = os.path.splitext(clip["file_path"])[0] + "_h264.mp4"
-                                if not os.path.exists(converted_path):
-                                    cmd = [
-                                        ffmpeg_exe, "-y",
-                                        "-i", clip["file_path"],
-                                        "-c:v", "libx264",
-                                        "-preset", "ultrafast",
-                                        "-pix_fmt", "yuv420p",
-                                        "-movflags", "+faststart",
-                                        converted_path
-                                    ]
-                                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                                if os.path.exists(converted_path):
-                                    file_to_play = converted_path
-                            except Exception:
-                                pass
-
-                            with open(file_to_play, "rb") as f:
-                                video_bytes = f.read()
-                            st.video(video_bytes, format="video/mp4")
+                        fpath = clip["file_path"]
+                        if os.path.exists(fpath):
+                            st.video(fpath)
                         else:
-                            st.warning("Video file not found on disk.")
+                            st.warning(f"Video file not found on disk: {fpath}")
 
                     st.markdown("---")

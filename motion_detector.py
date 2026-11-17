@@ -1,6 +1,6 @@
 """
-motion_detector.py — OpenCV motion detection + video recording
-Runs in a background thread; communicates via a shared state dict.
+motion_detector.py — Video streaming and recording engine (RTSP & Webcam)
+Runs in a background thread; records continuously between Start and Stop.
 """
 
 import os
@@ -17,13 +17,14 @@ from database import save_clip_fifo, CLIPS_DIR
 
 # ── Shared state (read by Streamlit app) ──────────────────────────────────────
 state = {
-    "running":        False,
-    "motion":         False,
-    "recording":      False,
-    "frame":          None,       # latest raw frame (numpy array BGR)
-    "clip_saved":     0,          # incremented each time a clip is saved
-    "error":          None,
-    "lock":           threading.Lock(),
+    "running":         False,      # thread active
+    "recording":       False,      # actively capturing & recording video
+    "frame":           None,       # latest raw frame (numpy array BGR)
+    "clip_saved":      0,          # incremented each time a clip is saved
+    "error":           None,       # connection/runtime error string
+    "start_time":      0.0,        # timestamp when current recording started
+    "last_saved_info": None,       # dict of last completed clip (name, duration, size)
+    "lock":            threading.Lock(),
 }
 
 _thread: threading.Thread | None = None
@@ -34,9 +35,13 @@ _thread: threading.Thread | None = None
 def _save_thumbnail(frame, base_name: str) -> str:
     """Save a JPEG thumbnail and return its path."""
     thumb_path = os.path.join(CLIPS_DIR, base_name + "_thumb.jpg")
-    small = cv2.resize(frame, (320, 240))
-    cv2.imwrite(thumb_path, small)
-    return thumb_path
+    try:
+        small = cv2.resize(frame, (320, 240))
+        cv2.imwrite(thumb_path, small)
+        return thumb_path
+    except Exception as e:
+        print(f"Thumbnail warning: {e}")
+        return ""
 
 
 def _convert_to_h264(raw_path: str, final_path: str):
@@ -44,6 +49,9 @@ def _convert_to_h264(raw_path: str, final_path: str):
     Convert raw OpenCV video to web-compatible H.264 (yuv420p) with faststart.
     Guarantees seamless playback in all modern browsers and Streamlit.
     """
+    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+        return
+
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [
@@ -65,63 +73,9 @@ def _convert_to_h264(raw_path: str, final_path: str):
             os.replace(raw_path, final_path)
 
 
-def _record_clip(cap, base_name: str, fps: float, width: int, height: int,
-                 motion_timeout: float = 3.0, min_area: int = 1500) -> tuple[str, int, int]:
-    """
-    Record until motion stops for `motion_timeout` seconds.
-    Encodes to web-standard H.264 MP4.
-    Returns (file_path, duration_seconds, size_kb).
-    """
-    raw_path   = os.path.join(CLIPS_DIR, base_name + "_raw.mp4")
-    final_path = os.path.join(CLIPS_DIR, base_name + ".mp4")
+# ── Main streaming & recording loop ───────────────────────────────────────────
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out    = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
-
-    start       = time.time()
-    last_motion = time.time()
-
-    bg_sub = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=50)
-
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        out.write(frame)
-
-        # Keep live frame feed updated even while recording
-        with state["lock"]:
-            state["frame"]     = frame.copy()
-            state["recording"] = True
-
-        fg = bg_sub.apply(frame)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if any(cv2.contourArea(c) > min_area for c in contours):
-            last_motion = time.time()
-
-        if time.time() - last_motion > motion_timeout:
-            break
-
-    out.release()
-
-    with state["lock"]:
-        state["recording"] = False
-
-    # Convert to web-standard H.264
-    _convert_to_h264(raw_path, final_path)
-
-    target_file = final_path if os.path.exists(final_path) else raw_path
-    duration    = max(1, int(time.time() - start))
-    size_kb     = int(os.path.getsize(target_file) / 1024) if os.path.exists(target_file) else 0
-
-    return target_file, duration, size_kb
-
-
-# ── Main detector loop ────────────────────────────────────────────────────────
-
-def _detector_loop(camera_source: int | str, min_area: int, sensitivity: int):
+def _stream_and_record_loop(camera_source: int | str):
     # Enforce TCP transport for RTSP streams to avoid packet drops / frame corruption
     os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
@@ -142,109 +96,161 @@ def _detector_loop(camera_source: int | str, min_area: int, sensitivity: int):
 
     if not cap.isOpened():
         with state["lock"]:
-            state["error"]   = f"Cannot open camera source: {camera_source}"
-            state["running"] = False
+            state["error"]     = f"Cannot open camera source: {camera_source}"
+            state["running"]   = False
+            state["recording"] = False
         return
 
-    # Warm-up / read sample frame to guarantee valid frame dimensions
-    ok, test_frame = cap.read()
-    if ok and test_frame is not None:
-        height, width = test_frame.shape[:2]
-    else:
-        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+    # Warm-up / sample frames to determine actual stream resolution
+    # RTSP streams often need 0.5 - 2 seconds to deliver the first keyframe (I-frame)
+    test_frame = None
+    for _ in range(50):
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.size > 0:
+            test_frame = frame
+            break
+        time.sleep(0.05)
 
+    if test_frame is None:
+        with state["lock"]:
+            state["error"]     = f"Connected to {camera_source}, but no video frames received."
+            state["running"]   = False
+            state["recording"] = False
+        cap.release()
+        return
+
+    height, width = test_frame.shape[:2]
+
+    # Resolve frame rate
     raw_fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = raw_fps if (raw_fps and raw_fps > 0 and not np.isnan(raw_fps)) else 20.0
+    fps = raw_fps if (raw_fps and raw_fps > 0 and not np.isnan(raw_fps) and raw_fps <= 60) else 20.0
 
-    var_threshold = max(10, 110 - sensitivity * 10)   # sensitivity 1–10
-    bg_sub = cv2.createBackgroundSubtractorMOG2(
-        history=500, varThreshold=var_threshold, detectShadows=False
-    )
+    # Prepare clip filenames
+    ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name  = f"clip_{ts}"
+    raw_path   = os.path.join(CLIPS_DIR, base_name + "_raw.mp4")
+    final_path = os.path.join(CLIPS_DIR, base_name + ".mp4")
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Generate thumbnail from first frame
+    thumb_path = _save_thumbnail(test_frame, base_name)
 
+    # Initialize video writer with EXACT frame dimensions
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out    = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
+
+    out.write(test_frame)
+    frames_written = 1
+
+    rec_start = time.time()
+    with state["lock"]:
+        state["recording"]  = True
+        state["start_time"] = rec_start
+        state["frame"]      = test_frame.copy()
+
+    frame_interval = 1.0 / fps
+
+    # Active recording loop
     while True:
         with state["lock"]:
             if not state["running"]:
                 break
 
+        loop_start = time.time()
         ok, frame = cap.read()
-        if not ok:
-            time.sleep(0.05)
+        if not ok or frame is None or frame.size == 0:
+            time.sleep(0.02)
             continue
 
-        # Update live frame for Streamlit preview
+        # Guarantee dimensions match VideoWriter to prevent OpenCV dropping frames
+        if frame.shape[:2] != (height, width):
+            frame = cv2.resize(frame, (width, height))
+
+        out.write(frame)
+        frames_written += 1
+
         with state["lock"]:
             state["frame"] = frame.copy()
 
-        # Motion detection
-        fg = bg_sub.apply(frame)
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)
-        contours, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        motion_detected = any(cv2.contourArea(c) > min_area for c in contours)
+        # Prevent CPU spinning
+        elapsed = time.time() - loop_start
+        sleep_dur = frame_interval - elapsed
+        if sleep_dur > 0.002:
+            time.sleep(sleep_dur)
 
-        with state["lock"]:
-            state["motion"] = motion_detected
-
-        if motion_detected and not state["recording"]:
-            # Base name from timestamp
-            ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_name = f"clip_{ts}"
-
-            # Thumbnail from first frame
-            thumb_path = _save_thumbnail(frame, base_name)
-
-            # Record clip (blocking — in this same thread)
-            clip_path, duration, size_kb = _record_clip(
-                cap, base_name, fps, width, height,
-                motion_timeout=3.0, min_area=min_area
-            )
-
-            # Save to DB (FIFO)
-            save_clip_fifo(
-                file_name      = base_name + ".mp4",
-                file_path      = clip_path,
-                thumbnail_path = thumb_path,
-                duration       = duration,
-                size_kb        = size_kb,
-            )
-
-            with state["lock"]:
-                state["clip_saved"] += 1
-
-        time.sleep(0.03)
-
+    # ── Finalize recording ────────────────────────────────────────────────────
+    out.release()
     cap.release()
+
+    if frames_written == 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+        with state["lock"]:
+            state["recording"] = False
+            state["error"] = "Recording ended but no frames were captured."
+        return
+
+    # Fallback thumbnail if first frame failed
+    if not thumb_path:
+        with state["lock"]:
+            last_frame = state["frame"]
+        if last_frame is not None:
+            thumb_path = _save_thumbnail(last_frame, base_name)
+
+    # Transcode to web-standard H.264
+    _convert_to_h264(raw_path, final_path)
+
+    target_file = final_path if os.path.exists(final_path) else raw_path
+    duration    = max(1, int(time.time() - rec_start))
+    size_kb     = int(os.path.getsize(target_file) / 1024) if os.path.exists(target_file) else 0
+
+    # Save to SQLite database with 30-day FIFO policy
+    save_clip_fifo(
+        file_name      = base_name + ".mp4",
+        file_path      = target_file,
+        thumbnail_path = thumb_path or "",
+        duration       = duration,
+        size_kb        = size_kb,
+    )
+
     with state["lock"]:
-        state["running"] = False
+        state["recording"]  = False
+        state["clip_saved"] += 1
+        state["last_saved_info"] = {
+            "file_name": base_name + ".mp4",
+            "duration": duration,
+            "size_kb": size_kb,
+        }
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def start(camera_source: int | str = 0, min_area: int = 1500, sensitivity: int = 5):
+def start(camera_source: int | str = 0, **kwargs):
+    """Start streaming from camera/RTSP and begin recording."""
     global _thread
     with state["lock"]:
         if state["running"]:
             return
-        state["running"] = True
-        state["error"]   = None
+        state["running"]         = True
+        state["error"]           = None
+        state["last_saved_info"] = None
 
     _thread = threading.Thread(
-        target=_detector_loop,
-        args=(camera_source, min_area, sensitivity),
+        target=_stream_and_record_loop,
+        args=(camera_source,),
         daemon=True,
     )
     _thread.start()
 
 
-def stop():
+def stop(wait: bool = True, timeout: float = 15.0):
+    """Stop recording, wait for encoding/DB save to complete, and return."""
+    global _thread
     with state["lock"]:
         state["running"] = False
+    if wait and _thread is not None and _thread.is_alive():
+        _thread.join(timeout=timeout)
 
 
 def get_frame_jpeg() -> bytes | None:
-    """Return current camera frame as JPEG bytes for Streamlit."""
+    """Return current camera frame as JPEG bytes for Streamlit preview."""
     with state["lock"]:
         frame = state["frame"]
     if frame is None:

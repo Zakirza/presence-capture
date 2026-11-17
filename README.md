@@ -1,8 +1,8 @@
-# 🔐 Burglar Presence & Motion-Triggered Video Surveillance System
+# 📹 RTSP Video Streamer and Retriever (RVSR)
 
-An intelligent, real-time security surveillance application built with **Python**, **OpenCV**, **Streamlit**, and **SQLite**. 
+An intelligent, real-time RTSP/CCTV video surveillance and clip retrieval application built with **Python**, **OpenCV**, **Streamlit**, and **SQLite**. 
 
-The system continuously monitors a camera stream, detects physical movement using background subtraction, records video clips automatically, and manages stored footage using an automated **30-day FIFO (First-In, First-Out) calendar-day retention policy**.
+The system continuously ingests live RTSP camera feeds (or local webcams), detects movement in real time using background subtraction, records video clips automatically, and manages stored footage using an automated **30-day FIFO (First-In, First-Out) calendar-day retention and retrieval pipeline**.
 
 ---
 
@@ -22,14 +22,15 @@ The system continuously monitors a camera stream, detects physical movement usin
 
 ## 🚀 Key Features
 
-* **Real-Time Motion Detection**: Uses OpenCV's Gaussian Mixture-based Background/Foreground Segmentation algorithm (`MOG2`) for robust motion detection under varying lighting conditions.
-* **Smart Auto-Recording**: Automatically records when motion begins, maintains recording throughout the activity, and stops after a 3-second post-motion buffer.
+* **Multi-Source Video Ingestion**: Supports both network **RTSP Streams** (IP cameras, CCTV, NVR feeds via TCP transport) and **Local Webcams** (integrated or USB cameras).
+* **On-Demand Start/Stop Recording**: Manual video recording control via Streamlit buttons. Hit **▶️ Start** to start streaming and recording, and **⏹️ Stop** to finalize, transcode, and store the clip.
+* **Live Stream Monitoring**: Real-time camera feed preview directly inside the Streamlit dashboard with active recording timer and badges.
 * **30-Day FIFO Day-Based Retention**: Stores clips grouped by calendar day. When clips arrive on Day 31, all video files and database records from the oldest day are purged automatically.
 * **Native Browser Video Playback**: Automatically encodes captured clips to **H.264 MP4 (`yuv420p`, `+faststart`)** via bundled FFmpeg, guaranteeing smooth playback across Chrome, Edge, Safari, Firefox, and mobile devices.
-* **Streamlit Web Dashboard**:
-  * **Live Camera Tab**: Real-time stream preview with status badges (`Monitoring`, `Motion Detected`, `Recording Clip`).
+* **Streamlit Web Dashboard & Retrieval Gallery**:
+  * **Live Stream Tab**: Real-time preview with live recording indicator and elapsed duration.
   * **Saved Clips Tab**: Grouped day-by-day with video thumbnails, recording timestamp, duration, file size, inline video player, and manual delete controls.
-* **Multithreaded Backend**: Motion detection and video encoding run in background threads to ensure the web dashboard remains responsive without freezing.
+* **Multithreaded Engine**: Streaming capture and FFmpeg video transcoding run in a background thread to ensure the web dashboard remains fluid and responsive.
 
 ---
 
@@ -37,29 +38,24 @@ The system continuously monitors a camera stream, detects physical movement usin
 
 ```
                       +-------------------+
-                      |   Camera Device   |
+                      |   RTSP / Webcam   |
                       +---------+---------+
                                 |
                                 v
                +---------------------------------+
-               |  Background Detection Thread    |
-               |  (OpenCV MOG2 & Contours)       |
+               |   Background Streaming Thread   |
+               |   (OpenCV TCP RTSP / DirectShow)|
                +----------------+----------------+
                                 |
           +---------------------+---------------------+
           |                                           |
           v                                           v
 +-------------------+                       +-------------------+
-| Live Frame Buffer |                       |  Motion Detected  |
-| (Streamlit Feed)  |                       +---------+---------+
-+-------------------+                                 |
-                                                      v
-                                            +-------------------+
-                                            |   Record Video    |
-                                            |   (OpenCV raw)    |
-                                            +---------+---------+
+| Live Frame Buffer |                       |  Active Recording |
+| (Streamlit Feed)  |                       |  (OpenCV Writer)  |
++-------------------+                       +---------+---------+
                                                       |
-                                                      v
+                                                      v  [User Hits Stop]
                                             +-------------------+
                                             |  FFmpeg H.264     |
                                             |  Web Conversion   |
@@ -208,14 +204,14 @@ Once started, open your web browser at:
 * **📡 Input Source**:
   * **Local Webcam**: Select input device index (`0` for built-in webcam, `1` or `2` for external USB cameras).
   * **RTSP Stream**: Enter an IP camera / CCTV / NVR stream URL (e.g. `rtsp://admin:password@192.168.1.100:554/stream1`).
-* **🎚️ Sensitivity (1–10)**: Adjusts detection threshold. Higher numbers detect subtle movements.
-* **📐 Min Motion Area (px²)**: Minimum pixel cluster size required to trigger an event (filters out small pets, shadows, or insects).
-* **▶️ Start / ⏹️ Stop**: Starts or halts the background camera monitoring thread.
-* **Status Card**: Displays real-time status (`Running`, `Motion Detected`, `Recording...`).
+* **▶️ Start / ⏹️ Stop**:
+  * **▶️ Start**: Begins streaming and immediately starts recording the live video.
+  * **⏹️ Stop**: Halts capture, automatically transcodes the recorded clip to H.264 MP4, and stores it in the database.
+* **📊 Status Card**: Displays real-time status (`Recording... (MM:SS)` or `Idle / Ready`), plus notification of the last saved clip.
 * **Storage Metric**: Live progress bar showing active days stored out of `MAX_DAYS (30)`.
 
 ### Main Panel Tabs
-1. **📡 Live Camera**: Shows the real-time camera view with color-coded situational badges.
+1. **📡 Live Stream**: Shows the real-time camera view with recording indicator and live elapsed timer.
 2. **📁 Saved Clips**:
    * Organized by date in collapsible day cards (latest day expanded by default).
    * Displays thumbnail, timestamp, duration, and file size.

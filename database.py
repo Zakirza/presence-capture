@@ -15,8 +15,9 @@ import os
 import sqlite3
 from datetime import datetime
 
-DB_PATH   = "burglar.db"
-CLIPS_DIR = "clips"
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+DB_PATH   = os.path.join(BASE_DIR, "burglar.db")
+CLIPS_DIR = os.path.join(BASE_DIR, "clips")
 MAX_DAYS  = 30          # ← only this number controls retention
 
 
@@ -153,6 +154,9 @@ def save_clip_fifo(file_name, file_path, thumbnail_path, duration, size_kb):
     event_id = cursor.lastrowid
 
     # Insert clip
+    file_path = os.path.abspath(file_path)
+    thumbnail_path = os.path.abspath(thumbnail_path) if thumbnail_path else ""
+
     cursor.execute("""
         INSERT INTO video_clips
             (event_id, file_name, file_path, thumbnail_path,
@@ -179,7 +183,15 @@ def get_all_clips():
         ORDER BY vc.recorded_at DESC
     """).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("file_path") and not os.path.isabs(d["file_path"]):
+            d["file_path"] = os.path.normpath(os.path.join(BASE_DIR, d["file_path"]))
+        if d.get("thumbnail_path") and not os.path.isabs(d["thumbnail_path"]):
+            d["thumbnail_path"] = os.path.normpath(os.path.join(BASE_DIR, d["thumbnail_path"]))
+        result.append(d)
+    return result
 
 
 def get_clips_by_day():
