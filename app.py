@@ -12,6 +12,13 @@ import io
 import database as db
 import motion_detector as md
 
+def format_duration(seconds: int) -> str:
+    """Format total seconds into standard HH:MM:SS."""
+    secs = max(0, int(seconds or 0))
+    hours, rem = divmod(secs, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="RTSP Video Streamer and Retriever",
@@ -84,7 +91,7 @@ with st.sidebar:
 
     if last_saved:
         size_mb = last_saved['size_kb'] / 1024
-        st.success(f"💾 **Saved:** `{last_saved['file_name']}`\n\n⏱️ {last_saved['duration']}s · 📦 {size_mb:.1f} MB")
+        st.success(f"💾 **Saved:** `{last_saved['file_name']}`\n\n⏱️ Duration: `{format_duration(last_saved['duration'])}` · 📦 {size_mb:.1f} MB")
 
     if err:
         st.error(f"⚠️ {err}")
@@ -180,7 +187,7 @@ with tab_clips:
                     time_str = clip["recorded_at"].split(" ")[-1][:8] if clip["recorded_at"] else "—"
                     cols[2].markdown(time_str)
 
-                    cols[3].markdown(f"{clip['duration_seconds']}s")
+                    cols[3].markdown(f"`{format_duration(clip['duration_seconds'])}`")
 
                     size_mb = clip["file_size_kb"] / 1024
                     cols[4].markdown(f"{size_mb:.1f} MB")
