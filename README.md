@@ -1,255 +1,171 @@
-# 📹 RTSP Video Streamer and Retriever (RVSR)
+# RTSP Video Streamer and Retriever (RVSR)
 
-An intelligent, real-time RTSP/CCTV video surveillance and clip retrieval application built with **Python**, **OpenCV**, **Streamlit**, and **SQLite**. 
+A Python camera recording and footage retrieval application built with Streamlit, OpenCV, SQLite, and FFmpeg. Connect a webcam or network camera, monitor its live feed, record with Start and Stop, and browse saved clips by recording date.
 
-The system continuously ingests live RTSP camera feeds (or local webcams), detects movement in real time using background subtraction, records video clips automatically, and manages stored footage using an automated **30-day FIFO (First-In, First-Out) calendar-day retention and retrieval pipeline**.
+## Features
 
----
+- Webcam capture from device indexes 0, 1, or 2.
+- RTSP capture over TCP, plus HTTP and HTTPS camera streams supported by OpenCV.
+- Continuous recording between Start and Stop.
+- Live preview with a recording banner and elapsed timer.
+- H.264 MP4 export with thumbnails and playback through the dashboard.
+- A date-grouped archive showing recording time, duration, and file size.
+- Automatic retention of up to 30 distinct recording dates.
+- Manual clip deletion with a retry message when a file is locked.
+- Recovery of captured footage when the camera read fails during recording.
 
-## 📌 Table of Contents
-- [Key Features](#-key-features)
-- [System Architecture](#-system-architecture)
-- [Database & 30-Day FIFO Strategy](#-database--30-day-fifo-strategy)
-- [Video Recording & Web Playback Pipeline](#-video-recording--web-playback-pipeline)
-- [Project Structure](#-project-structure)
-- [Prerequisites & Installation](#-prerequisites--installation)
-- [How to Run](#-how-to-run)
-- [User Interface Guide](#-user-interface-guide)
-- [Configuration & Tuning](#-configuration--tuning)
-- [Troubleshooting & FAQ](#-troubleshooting--faq)
+## Install
 
----
+Use Python 3.10 or newer with a webcam or an accessible network camera.
 
-## 🚀 Key Features
+Clone the project branch and install its dependencies from PowerShell.
 
-* **Multi-Source Video Ingestion**: Supports both network **RTSP Streams** (IP cameras, CCTV, NVR feeds via TCP transport) and **Local Webcams** (integrated or USB cameras).
-* **On-Demand Start/Stop Recording**: Manual video recording control via Streamlit buttons. Hit **▶️ Start** to start streaming and recording, and **⏹️ Stop** to finalize, transcode, and store the clip.
-* **Live Stream Monitoring**: Real-time camera feed preview directly inside the Streamlit dashboard with active recording timer and badges.
-* **30-Day FIFO Day-Based Retention**: Stores clips grouped by calendar day. When clips arrive on Day 31, all video files and database records from the oldest day are purged automatically.
-* **Native Browser Video Playback**: Automatically encodes captured clips to **H.264 MP4 (`yuv420p`, `+faststart`)** via bundled FFmpeg, guaranteeing smooth playback across Chrome, Edge, Safari, Firefox, and mobile devices.
-* **Streamlit Web Dashboard & Retrieval Gallery**:
-  * **Live Stream Tab**: Real-time preview with live recording indicator and elapsed duration.
-  * **Saved Clips Tab**: Grouped day-by-day with video thumbnails, recording timestamp, duration, file size, inline video player, and manual delete controls.
-* **Multithreaded Engine**: Streaming capture and FFmpeg video transcoding run in a background thread to ensure the web dashboard remains fluid and responsive.
-
----
-
-## 🏛️ System Architecture
-
-```
-                      +-------------------+
-                      |   RTSP / Webcam   |
-                      +---------+---------+
-                                |
-                                v
-               +---------------------------------+
-               |   Background Streaming Thread   |
-               |   (OpenCV TCP RTSP / DirectShow)|
-               +----------------+----------------+
-                                |
-          +---------------------+---------------------+
-          |                                           |
-          v                                           v
-+-------------------+                       +-------------------+
-| Live Frame Buffer |                       |  Active Recording |
-| (Streamlit Feed)  |                       |  (OpenCV Writer)  |
-+-------------------+                       +---------+---------+
-                                                      |
-                                                      v  [User Hits Stop]
-                                            +-------------------+
-                                            |  FFmpeg H.264     |
-                                            |  Web Conversion   |
-                                            +---------+---------+
-                                                      |
-                                                      v
-                                            +-------------------+
-                                            |  SQLite Database  |
-                                            |  (FIFO Evaluation)|
-                                            +---------+---------+
-                                                      |
-                                      +---------------+---------------+
-                                      |                               |
-                                      v                               v
-                            [Under 30 Days]                   [New Day >= 31]
-                             Save new clip                     Delete oldest day's
-                                                               files & DB rows
+```powershell
+git clone --branch RTSP_STREAM --single-branch https://github.com/Dishant-01/Fire-Detection-System.git
+Set-Location Fire-Detection-System
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
----
+The dependencies include Streamlit, OpenCV, NumPy, Pillow, and imageio-ffmpeg. The imageio-ffmpeg package provides the FFmpeg executable used for video conversion.
 
-## 🗄️ Database & 30-Day FIFO Strategy
+## Run
 
-The system uses **SQLite** (`burglar.db`) for lightweight, serverless metadata storage.
+### Using Python
 
-### 1. Database Schema
+From the project folder, run the following command in PowerShell.
 
-#### `motion_events`
-| Column | Type | Description |
-|---|---|---|
-| `event_id` | `INTEGER PRIMARY KEY` | Auto-incrementing unique event identifier |
-| `detected_at` | `DATETIME` | Timestamp when motion was first flagged |
-| `ended_at` | `DATETIME` | Timestamp when motion event concluded |
-| `status` | `TEXT` | Event status (`saved`, `processing`) |
-
-#### `video_clips`
-| Column | Type | Description |
-|---|---|---|
-| `clip_id` | `INTEGER PRIMARY KEY` | Auto-incrementing unique clip identifier |
-| `event_id` | `INTEGER` | Foreign key referencing `motion_events(event_id)` |
-| `file_name` | `TEXT` | Filename (e.g., `clip_20261116_100000.mp4`) |
-| `file_path` | `TEXT` | Absolute or relative path on disk |
-| `thumbnail_path` | `TEXT` | Path to preview JPEG image |
-| `duration_seconds`| `INTEGER` | Length of recorded clip in seconds |
-| `file_size_kb` | `INTEGER` | Size of video file on disk in kilobytes |
-| `recorded_at` | `DATETIME` | Full timestamp of recording |
-| `clip_date` | `DATE` | Calendar date (`YYYY-MM-DD`) used for FIFO retention |
-
----
-
-### 2. How the 30-Day FIFO Retention Works
-
-Unlike simple count-based queues that cap at an arbitrary number of clips (which can lose footage quickly on active days), this system manages retention by **distinct calendar days**:
-
-1. Up to **30 distinct days** of security clips are retained.
-2. If multiple clips occur on the same day, **all** clips for that day are preserved.
-3. When motion occurs on a **brand-new 31st calendar day**:
-   * The database identifies the **oldest registered date** (`MIN(clip_date)`).
-   * All associated video files (`.mp4`) and thumbnails (`.jpg`) are physically deleted from the `clips/` directory.
-   * The corresponding rows in `video_clips` and `motion_events` are deleted.
-   * The new clip is then safely committed.
-
----
-
-## 🎬 Video Recording & Web Playback Pipeline
-
-Standard OpenCV video output (`mp4v` or `XVID`) cannot be decoded by modern web browsers in HTML5 `<video>` tags. This project implements a dedicated encoding pipeline:
-
-1. **Capture**: OpenCV records raw video frames into an intermediate file.
-2. **Buffer Cooldown**: A 3.0-second inactivity timer ensures the subject has left the frame before the recording closes.
-3. **Thumbnail Generation**: A 320x240 preview frame is saved at the onset of detection.
-4. **H.264 Transcoding**: Uses `imageio-ffmpeg` to transcode the video using:
-   * **Codec**: `libx264` (H.264 Baseline/Main profile)
-   * **Pixel Format**: `yuv420p` (mandatory for HTML5 browser compatibility)
-   * **Container Flags**: `+faststart` (relocates the `moov` atom to the front for instant streaming without full download)
-   * **Preset**: `ultrafast` (minimal CPU overhead during background conversion)
-
----
-
-## 📂 Project Structure
-
-```
-burgler presence/
-│
-├── app.py                 # Streamlit frontend dashboard (Live feed & Clips gallery)
-├── motion_detector.py     # Background thread for OpenCV motion tracking & recording
-├── database.py            # SQLite schema initialization, queries, and FIFO day-pruning
-├── requirements.txt       # Python package dependencies
-├── run.bat                # Windows quick-launcher script
-│
-├── burglar.db             # SQLite database file (created automatically on startup)
-└── clips/                 # Video storage directory (created automatically)
-    ├── clip_20261116_090000.mp4
-    ├── clip_20261116_090000_thumb.jpg
-    └── ...
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
 ```
 
----
+With dependencies installed in an active Python environment, you can also use the following command.
 
-## ⚙️ Prerequisites & Installation
-
-### Requirements
-* **Operating System**: Windows 10/11, Linux, or macOS
-* **Python**: Python 3.10 to 3.12 (Anaconda or standard Python)
-* **Camera**: Integrated webcam, external USB camera, or RTSP IP Camera / CCTV / NVR stream
-
-### Setup Instructions
-
-1. **Clone or open the project folder**:
-   ```bash
-   cd "burgler presence"
-   ```
-
-2. **Install required dependencies**:
-   Using Anaconda Python:
-   ```bash
-   C:\Users\<username>\anaconda3\python.exe -m pip install -r requirements.txt
-   ```
-   Or using standard Python virtual environment:
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
-
----
-
-## 🚦 How to Run
-
-### Option 1: Double-Click Launcher (Windows)
-Double-click [`run.bat`](file:///c:/Users/mohdz/OneDrive/Documents/burgler%20presence/run.bat). It automatically initializes Streamlit with the configured Anaconda environment.
-
-### Option 2: Terminal / Command Prompt
-```bash
-cd "c:\Users\mohdz\OneDrive\Documents\burgler presence"
-C:\Users\mohdz\anaconda3\python.exe -m streamlit run app.py
+```powershell
+python -m streamlit run app.py
 ```
 
-Once started, open your web browser at:
-* **Local URL**: `http://localhost:8501`
-* **Network URL**: `http://<your-lan-ip>:8501` (accessible from your smartphone on the same Wi-Fi)
+Open the Local URL printed in the terminal, usually [http://localhost:8501](http://localhost:8501). Keep the terminal open while using the dashboard.
 
----
+### Using run.bat on Windows
 
-## 🖥️ User Interface Guide
+The current [run.bat](run.bat) contains machine-specific paths. Before using it on a different machine or in a new clone, edit its project directory and Python executable to match your installation.
 
-### Sidebar Controls
-* **📡 Input Source**:
-  * **Local Webcam**: Select input device index (`0` for built-in webcam, `1` or `2` for external USB cameras).
-  * **RTSP Stream**: Enter an IP camera / CCTV / NVR stream URL (e.g. `rtsp://admin:password@192.168.1.100:554/stream1`).
-* **▶️ Start / ⏹️ Stop**:
-  * **▶️ Start**: Begins streaming and immediately starts recording the live video.
-  * **⏹️ Stop**: Halts capture, automatically transcodes the recorded clip to H.264 MP4, and stores it in the database.
-* **📊 Status Card**: Displays real-time status (`Recording... (MM:SS)` or `Idle / Ready`), plus notification of the last saved clip.
-* **Storage Metric**: Live progress bar showing active days stored out of `MAX_DAYS (30)`.
+For a virtual environment inside the project folder, the launcher can use the following contents.
 
-### Main Panel Tabs
-1. **📡 Live Stream**: Shows the real-time camera view with recording indicator and live elapsed timer.
-2. **📁 Saved Clips**:
-   * Organized by date in collapsible day cards (latest day expanded by default).
-   * Displays thumbnail, timestamp, duration, and file size.
-   * **▶️ Play / Hide**: Plays video smoothly within the browser with full playback and seek controls.
-   * **🗑️ Delete**: Allows manual removal of individual clips.
+```bat
+@echo off
+cd /d "%~dp0"
+".venv\Scripts\python.exe" -m streamlit run app.py
+pause
+```
 
----
+After configuring it, double-click run.bat or execute the following command from PowerShell.
 
-## 🔧 Configuration & Tuning
+```powershell
+.\run.bat
+```
 
-Key parameters can be adjusted in the source files:
+## Record and play footage
 
-| Setting | File | Variable | Default | Description |
-|---|---|---|---|---|
-| Retention Limit | `database.py` | `MAX_DAYS` | `30` | Maximum calendar days retained before purging oldest day |
-| Buffer Timeout | `motion_detector.py` | `motion_timeout` | `3.0` | Seconds to record after movement stops |
-| Sensitivity | `app.py` / `motion_detector.py` | `sensitivity` | `5` | Background subtractor threshold level |
-| Min Contour Size | `app.py` / `motion_detector.py` | `min_area` | `1500` | Minimum movement contour area in pixels |
+1. Select Local Webcam and choose the camera index, or select RTSP Stream and enter your camera URL.
+2. Click Start. Recording begins once the first camera frame arrives.
+3. Open Live Stream to watch the feed and recording timer.
+4. Click Stop to end capture. Wait for conversion and saving to finish.
+5. Open Saved Clips, expand a recording date, and click Play / Hide to view a clip.
+6. Use Delete to remove a clip. If a file is locked, close applications using it and retry.
 
----
+A typical RTSP URL has the form `rtsp://username:password@camera-address:554/stream1`. The RTSP Stream input also accepts HTTP or HTTPS video stream URLs that OpenCV can decode.
 
-## ❓ Troubleshooting & FAQ
+The capture thread and controls are shared across browser sessions connected to the same running server. A Stop action from another session ends the active recording.
 
-#### 1. Why won't clips play in my browser?
-* Modern browsers require the H.264 video codec. This project uses `imageio-ffmpeg` to automatically encode all clips to H.264 with `yuv420p` pixel format.
-* If an older clip fails to play, clicking **▶️ Play / Hide** triggers an automatic background repair that converts the clip on the fly.
+## Live preview
 
-#### 2. "Cannot open camera index 0"
-* Ensure no other application (Zoom, Teams, Skype, Windows Camera app) is using the webcam.
-* If using an external USB camera, change the camera dropdown in the sidebar from `0` to `1`.
+[app.py](app.py) loads [live_preview/index.html](live_preview/index.html) as a Streamlit component. Launching the dashboard starts everything needed for the preview.
 
-#### 3. Where are the recorded files stored?
-* All video recordings (`.mp4`) and previews (`_thumb.jpg`) are stored in the local [`clips/`](file:///c:/Users/mohdz/OneDrive/Documents/burgler%20presence/clips) folder.
+The preview receives JPEG frames from the capture thread roughly every 0.2 seconds while recording. A persistent canvas holds the displayed image while the next frame decodes. The timer runs in the browser, and decoding is serialized so a slow browser can continue displaying completed frames.
 
-#### 4. Can I access the feed from my mobile phone?
-* Yes! Ensure your phone is connected to the same Wi-Fi network as the host computer. Open your phone's browser and navigate to the **Network URL** displayed in the terminal (e.g., `http://192.168.1.X:8501`).
+Recording runs in a background thread independently of browser preview updates. The preview refresh rate is separate from the recorded frame rate.
 
----
+## Recording pipeline
 
-## 📄 License
-This project is for personal security and educational surveillance use. Feel free to customize and extend it for your specific monitoring requirements.
+1. OpenCV opens the selected camera and waits for the first frame.
+2. Frames are written to an intermediate MJPEG AVI file, and a 320 by 240 JPEG thumbnail is created.
+3. Stop, a feed timeout, or an OpenCV camera read error ends capture.
+4. FFmpeg converts captured footage to H.264 MP4 using `libx264`, `yuv420p`, the `ultrafast` preset, and `+faststart`.
+5. Playback timing is adjusted to match the elapsed captured footage.
+6. SQLite stores the clip metadata, and the intermediate AVI is removed after a successful save.
+
+If conversion fails, the raw AVI is kept and the app reports its path. If database insertion fails after conversion, the MP4 is kept and the app reports its path.
+
+## Storage and retention
+
+The app creates [clips/](clips/) and `burglar.db` automatically beside the Python files. Clip metadata includes absolute file paths, the recording start timestamp, duration, file size, thumbnail path, and recording date.
+
+The recording start time uses the host computer's local clock. A recording crossing midnight belongs to its start date.
+
+SQLite contains three tables.
+
+- `motion_events` stores the recording start timestamp and saved status. Its name is retained from the earlier schema.
+- `video_clips` stores file metadata and references the corresponding event.
+- `pending_file_deletions` tracks files awaiting retention cleanup.
+
+The default limit is 30 distinct dates with stored recordings. Every clip from a retained date can be kept. A date with no recordings consumes no slot.
+
+When saving would exceed the date limit, the app retires the oldest other dates until the archive fits the limit. The new clip, retired metadata, and pending file deletions are committed together. File cleanup follows the commit.
+
+Locked files remain queued for another cleanup attempt on subsequent saves or database initialization. Pending files can continue occupying disk space until deletion succeeds.
+
+Manual deletion keeps the database entry until file removal succeeds, allowing a failed operation to be retried.
+
+Recordings, thumbnails, databases, and virtual environments are excluded from Git by [.gitignore](.gitignore).
+
+## Project files
+
+```text
+app.py                    Streamlit dashboard and camera controls
+motion_detector.py        Capture thread, recording, thumbnails, and conversion
+database.py               SQLite queries, migration, and retention cleanup
+live_preview/index.html   Browser canvas, frame decoding, and elapsed timer
+requirements.txt          Python dependencies
+run.bat                   Windows launcher
+clips/                    Generated videos and thumbnails
+burglar.db                Generated SQLite database
+```
+
+## Configuration
+
+- Change `MAX_DAYS` in [database.py](database.py) to adjust the distinct recording date limit. Use a positive integer.
+- Change `FRAME_TIMEOUT` in [motion_detector.py](motion_detector.py) to adjust the network read timeout and the wait for frames. The default is 3 seconds.
+- Change `run_every` in the live Streamlit fragment in [app.py](app.py) to adjust preview refresh frequency. The recording default is 0.2 seconds.
+- Webcam capture uses DirectShow on Windows and OpenCV's automatic backend selection on other operating systems.
+
+## Troubleshooting
+
+### Camera cannot open
+
+Close other applications using the webcam, check operating system camera permissions, or try another device index. For network cameras, verify the URL, credentials, reachability, and stream support.
+
+### Camera feed stops responding
+
+The app ends capture and attempts to save the frames already recorded. Check the camera connection and inspect the error displayed in the sidebar.
+
+### Saving takes time after Stop
+
+FFmpeg converts the complete recording before it appears in Saved Clips. Large recordings can take longer to process. Wait for the app to return to Idle / Ready.
+
+### Video fails to play
+
+Check that the saved MP4 exists and that conversion completed successfully. Inspect the terminal for FFmpeg errors. Older files may need manual conversion to browser-compatible H.264 MP4.
+
+### Delete fails
+
+Close players or other applications holding the file open, then retry Delete. Automatic retention cleanup retries queued files on later saves or initialization.
+
+### Opening from another device
+
+Use the Network URL printed by Streamlit when it is available. The client must be able to reach the host and port through the local network and firewall.
+
+### Launching from a new clone opens the old folder
+
+Update the paths in run.bat or use the project-relative launcher shown above. Its current hard-coded paths can point to the original development folder.
