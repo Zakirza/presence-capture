@@ -1,17 +1,16 @@
 """
 motion_detector.py — Video streaming and recording engine (RTSP & Webcam)
 Runs in a background thread; records continuously between Start and Stop.
-Guarantees 1:1 real-world recording duration and normal playback speed.
+Adjusts playback duration to match the captured footage.
 """
 
 import os
+import sys
 import time
 import threading
 import subprocess
 import cv2
-import numpy as np
 from datetime import datetime
-from PIL import Image
 import imageio_ffmpeg
 from database import save_clip_fifo, CLIPS_DIR
 
@@ -29,6 +28,7 @@ state = {
 }
 
 _thread: threading.Thread | None = None
+FRAME_TIMEOUT = 3.0
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -38,8 +38,7 @@ def _save_thumbnail(frame, base_name: str) -> str:
     thumb_path = os.path.join(CLIPS_DIR, base_name + "_thumb.jpg")
     try:
         small = cv2.resize(frame, (320, 240))
-        cv2.imwrite(thumb_path, small)
-        return thumb_path
+        return thumb_path if cv2.imwrite(thumb_path, small) else ""
     except Exception as e:
         print(f"Thumbnail warning: {e}")
         return ""
@@ -50,40 +49,31 @@ def _convert_to_h264(raw_path: str, final_path: str, real_duration: float, frame
     Convert raw OpenCV video to web-compatible H.264 (yuv420p) with faststart.
     Adjusts presentation timestamps (setpts) so playback duration matches real elapsed recording time.
     """
-    if not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
-        return
-
+    pending_path = final_path.removesuffix(".mp4") + "_encoding.mp4"
+    container_duration = frames_written / writer_fps
+    speed_ratio = real_duration / container_duration
+    cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-loglevel", "error", "-y",
+        "-i", raw_path, "-vf", f"setpts={speed_ratio:.6f}*PTS,fps=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", pending_path,
+    ]
     try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        if os.path.getsize(pending_path) == 0:
+            raise RuntimeError("FFmpeg produced an empty video.")
+        os.replace(pending_path, final_path)
+    finally:
+        _remove_intermediate(pending_path)
 
-        # Compute speed adjustment ratio:
-        # container_duration = frames / writer_fps
-        # If container_duration < real_duration, video would play fast-forward unless stretched.
-        container_duration = max(0.1, frames_written / max(1.0, writer_fps))
-        speed_ratio = real_duration / container_duration if container_duration > 0 else 1.0
 
-        # Enforce exact real-world duration and standardize to 30fps web video
-        vf_filter = f"setpts={speed_ratio:.6f}*PTS,fps=30"
-
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-i", raw_path,
-            "-vf", vf_filter,
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            final_path
-        ]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-
-        if os.path.exists(raw_path) and os.path.abspath(raw_path) != os.path.abspath(final_path):
-            os.remove(raw_path)
-    except Exception as e:
-        print(f"H.264 conversion warning: {e}")
-        # Fallback: if conversion failed, preserve raw file
-        if os.path.exists(raw_path) and not os.path.exists(final_path):
-            os.replace(raw_path, final_path)
+def _remove_intermediate(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"Could not remove intermediate file {path}: {exc}")
 
 
 # ── Main streaming & recording loop ───────────────────────────────────────────
@@ -99,165 +89,176 @@ def _stream_and_record_loop(camera_source: int | str):
     )
 
     if is_network_stream:
-        cap = cv2.VideoCapture(camera_source)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap = cv2.VideoCapture(camera_source, cv2.CAP_FFMPEG, [
+            cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+            cv2.CAP_PROP_READ_TIMEOUT_MSEC, int(FRAME_TIMEOUT * 1000),
+        ])
     else:
-        try:
-            cam_idx = int(camera_source)
-        except (ValueError, TypeError):
-            cam_idx = 0
-        cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
-        # Enable hardware MJPEG on Windows webcams for full 30 FPS USB throughput
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(int(camera_source), backend)
 
-    if not cap.isOpened():
-        with state["lock"]:
-            state["error"]     = f"Cannot open camera source: {camera_source}"
-            state["running"]   = False
-            state["recording"] = False
-        return
+    out = None
+    try:
+        if not cap.isOpened():
+            raise RuntimeError("Cannot open the selected camera.")
+        if not is_network_stream:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FPS, 30)
 
-    # Warm-up / sample frames to determine actual stream resolution
-    test_frame = None
-    for _ in range(50):
-        ok, frame = cap.read()
-        if ok and frame is not None and frame.size > 0:
-            test_frame = frame
-            break
-        time.sleep(0.04)
+        deadline = time.monotonic() + FRAME_TIMEOUT
+        while time.monotonic() < deadline:
+            with state["lock"]:
+                if not state["running"]:
+                    return
+            ok, frame = cap.read()
+            if ok and frame is not None and frame.size:
+                break
+            time.sleep(0.04)
+        else:
+            raise RuntimeError("The camera opened, but no video frames arrived.")
 
-    if test_frame is None:
-        with state["lock"]:
-            state["error"]     = f"Connected to {camera_source}, but no video frames received."
-            state["running"]   = False
-            state["recording"] = False
-        cap.release()
-        return
-
-    height, width = test_frame.shape[:2]
-
-    # Resolve frame rate (default 30.0 for smooth capture)
-    raw_fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = raw_fps if (raw_fps and raw_fps > 0 and not np.isnan(raw_fps) and raw_fps <= 60) else 30.0
-
-    # Prepare clip filenames
-    ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name  = f"clip_{ts}"
-    # Use MJPG in AVI for fast, low-CPU writing without encoding delay
-    raw_path   = os.path.join(CLIPS_DIR, base_name + "_raw.avi")
-    final_path = os.path.join(CLIPS_DIR, base_name + ".mp4")
-
-    # Generate thumbnail from first frame
-    thumb_path = _save_thumbnail(test_frame, base_name)
-
-    # Initialize video writer with fast MJPG codec
-    fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-    out    = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
-
-    out.write(test_frame)
-    frames_written = 1
-
-    rec_start = time.time()
-    with state["lock"]:
-        state["recording"]  = True
-        state["start_time"] = rec_start
-        state["frame"]      = test_frame.copy()
-
-    # Active recording loop
-    while True:
         with state["lock"]:
             if not state["running"]:
-                break
+                return
 
-        ok, frame = cap.read()
-        if not ok or frame is None or frame.size == 0:
-            time.sleep(0.01)
-            continue
+        height, width = frame.shape[:2]
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = raw_fps if 0 < raw_fps <= 60 else 30.0
 
-        # Guarantee dimensions match VideoWriter
-        if frame.shape[:2] != (height, width):
-            frame = cv2.resize(frame, (width, height))
+        recorded_at = datetime.now()
+        base_name = recorded_at.strftime("clip_%Y%m%d_%H%M%S_%f")
+        raw_path = os.path.join(CLIPS_DIR, base_name + "_raw.avi")
+        final_name = base_name + ".mp4"
+        final_path = os.path.join(CLIPS_DIR, final_name)
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        out = cv2.VideoWriter(raw_path, fourcc, fps, (width, height))
+        if not out.isOpened():
+            raise RuntimeError("Could not open the recording file for writing.")
 
         out.write(frame)
-        frames_written += 1
-
+        frames_written = 1
+        started = last_frame_at = time.monotonic()
+        thumb_path = _save_thumbnail(frame, base_name)
         with state["lock"]:
-            state["frame"] = frame.copy()
+            state["recording"] = True
+            state["start_time"] = recorded_at.timestamp()
+            state["frame"] = frame
 
-    # ── Finalize recording ────────────────────────────────────────────────────
-    rec_end = time.time()
-    real_duration = max(1.0, rec_end - rec_start)
+        while True:
+            with state["lock"]:
+                if not state["running"]:
+                    break
 
-    out.release()
-    cap.release()
+            try:
+                ok, frame = cap.read()
+            except cv2.error:
+                with state["lock"]:
+                    if state["running"]:
+                        state["error"] = "Camera read failed. Recording ended early."
+                break  # Finalize the frames already written.
+            received_at = time.monotonic()
+            with state["lock"]:
+                if not state["running"]:
+                    break
+            if not ok or frame is None or not frame.size:
+                if received_at - last_frame_at >= FRAME_TIMEOUT:
+                    with state["lock"]:
+                        state["error"] = "Camera feed stopped responding. Recording ended early."
+                    break
+                time.sleep(0.01)
+                continue
 
-    if frames_written == 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) == 0:
+            if frame.shape[:2] != (height, width):
+                frame = cv2.resize(frame, (width, height))
+
+            out.write(frame)
+            frames_written += 1
+            last_frame_at = received_at
+            with state["lock"]:
+                state["frame"] = frame
+    finally:
         with state["lock"]:
+            state["running"] = False
             state["recording"] = False
-            state["error"] = "Recording ended but no frames were captured."
-        return
+            state["frame"] = None
+        if out is not None:
+            out.release()
+        cap.release()
 
-    # Fallback thumbnail if first frame failed
-    if not thumb_path:
-        with state["lock"]:
-            last_frame = state["frame"]
-        if last_frame is not None:
-            thumb_path = _save_thumbnail(last_frame, base_name)
+    if not os.path.isfile(raw_path) or not os.path.getsize(raw_path):
+        raise RuntimeError("Recording ended without a video file.")
 
-    # Transcode to web-standard H.264 with exact real-world duration synchronization
-    _convert_to_h264(raw_path, final_path, real_duration, frames_written, fps)
+    real_duration = max(1.0, last_frame_at - started + 1 / fps)
+    try:
+        _convert_to_h264(raw_path, final_path, real_duration, frames_written, fps)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            print(exc.stderr.decode(errors="replace").strip())
+        raise RuntimeError(f"Could not convert the recording. Raw footage was kept at {raw_path}.") from exc
 
-    target_file = final_path if os.path.exists(final_path) else raw_path
-    duration_sec = max(1, int(real_duration))
-    size_kb      = int(os.path.getsize(target_file) / 1024) if os.path.exists(target_file) else 0
-
-    # Save to SQLite database with 30-day FIFO policy
-    save_clip_fifo(
-        file_name      = base_name + ".mp4",
-        file_path      = target_file,
-        thumbnail_path = thumb_path or "",
-        duration       = duration_sec,
-        size_kb        = size_kb,
-    )
+    duration_sec = int(real_duration)
+    size_kb = os.path.getsize(final_path) // 1024
+    try:
+        save_clip_fifo(final_name, final_path, thumb_path, duration_sec, size_kb, recorded_at)
+    except Exception as exc:
+        raise RuntimeError(f"Could not add the recording to Saved Clips. The MP4 was kept at {final_path}.") from exc
+    _remove_intermediate(raw_path)
 
     with state["lock"]:
-        state["recording"]  = False
         state["clip_saved"] += 1
         state["last_saved_info"] = {
-            "file_name": base_name + ".mp4",
+            "file_name": final_name,
             "duration": duration_sec,
             "size_kb": size_kb,
         }
 
 
+def _record(camera_source: int | str):
+    try:
+        _stream_and_record_loop(camera_source)
+    except Exception as exc:
+        print(f"Recording failed: {exc!r}")
+        if exc.__cause__:
+            print(f"Cause: {exc.__cause__!r}")
+        with state["lock"]:
+            state["running"] = False
+            state["recording"] = False
+            state["frame"] = None
+            state["error"] = str(exc) if isinstance(exc, RuntimeError) else "Recording failed. See the server log."
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def is_finalizing() -> bool:
+    with state["lock"]:
+        return not state["running"] and _thread is not None and _thread.is_alive()
+
 
 def start(camera_source: int | str = 0, **kwargs):
     """Start streaming from camera/RTSP and begin recording."""
     global _thread
     with state["lock"]:
-        if state["running"]:
+        if state["running"] or (_thread is not None and _thread.is_alive()):
             return
         state["running"]         = True
         state["error"]           = None
         state["last_saved_info"] = None
 
-    _thread = threading.Thread(
-        target=_stream_and_record_loop,
-        args=(camera_source,),
-        daemon=True,
-    )
-    _thread.start()
+        _thread = threading.Thread(
+            target=_record,
+            args=(camera_source,),
+            daemon=True,
+        )
+        _thread.start()
 
 
 def stop(wait: bool = True, timeout: float = 20.0):
     """Stop recording, wait for encoding/DB save to complete, and return."""
-    global _thread
     with state["lock"]:
         state["running"] = False
-    if wait and _thread is not None and _thread.is_alive():
-        _thread.join(timeout=timeout)
+        worker = _thread
+    if wait and worker is not None:
+        worker.join(timeout=timeout)
 
 
 def get_frame_jpeg() -> bytes | None:
@@ -266,5 +267,5 @@ def get_frame_jpeg() -> bytes | None:
         frame = state["frame"]
     if frame is None:
         return None
-    _, buf = cv2.imencode(".jpg", frame)
-    return buf.tobytes()
+    ok, buf = cv2.imencode(".jpg", frame)
+    return buf.tobytes() if ok else None

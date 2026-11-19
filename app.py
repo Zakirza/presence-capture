@@ -3,14 +3,20 @@ app.py — Streamlit frontend for RTSP Video Streamer and Retriever
 Run with:  streamlit run app.py
 """
 
-import time
+import base64
 import os
+import time
+from pathlib import Path
+
 import streamlit as st
-from PIL import Image
-import io
+import streamlit.components.v1 as components
 
 import database as db
 import motion_detector as md
+
+live_preview = components.declare_component(
+    "live_preview", path=str(Path(__file__).with_name("live_preview"))
+)
 
 def format_duration(seconds: int) -> str:
     """Format total seconds into standard HH:MM:SS."""
@@ -34,9 +40,10 @@ db.init_db()
 with md.state["lock"]:
     is_running   = md.state["running"]
     is_recording = md.state["recording"]
-    start_time   = md.state["start_time"]
+    recording_started_at = md.state["start_time"]
     err          = md.state["error"]
     last_saved   = md.state["last_saved_info"]
+is_finalizing = md.is_finalizing()
 
 # ── Sidebar — Controls & Settings ─────────────────────────────────────────────
 with st.sidebar:
@@ -64,7 +71,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### 🎬 Recording Controls")
     col1, col2 = st.columns(2)
-    start_btn  = col1.button("▶️ Start", use_container_width=True, type="primary", disabled=is_running)
+    start_btn  = col1.button("▶️ Start", use_container_width=True, type="primary", disabled=is_running or is_finalizing)
     stop_btn   = col2.button("⏹️ Stop",  use_container_width=True, disabled=not is_running)
 
     if start_btn:
@@ -79,13 +86,17 @@ with st.sidebar:
     st.markdown("---")
 
     # Status indicators
-    st.markdown("### 📊 Status")
+    status_heading = "### 📊 Status"
+    if is_recording:
+        # Streamlit 1.37 shows its script activity indicator on every fragment tick.
+        status_heading += '\n\n<style>[data-testid="stStatusWidget"] { visibility: hidden; }</style>'
+    st.markdown(status_heading, unsafe_allow_html=True)
     if is_running and is_recording:
-        elapsed = max(0, int(time.time() - start_time)) if start_time else 0
-        mins, secs = divmod(elapsed, 60)
-        st.error(f"🔴 **Recording...** ({mins:02d}:{secs:02d})")
+        st.error("🔴 **Recording...**")
     elif is_running:
         st.warning("🟡 Initializing stream...")
+    elif is_finalizing:
+        st.info("Finalizing recording...")
     else:
         st.info("⚪ **Idle / Ready**")
 
@@ -100,7 +111,7 @@ with st.sidebar:
     day_count  = db.get_day_count()
     st.markdown("---")
     st.metric("📅 Days Stored",  f"{day_count} / {db.MAX_DAYS}")
-    st.progress(day_count / db.MAX_DAYS)
+    st.progress(min(day_count / db.MAX_DAYS, 1.0))
     st.caption(f"📼 Total clips: {clip_count}")
 
 
@@ -112,32 +123,29 @@ tab_live, tab_clips = st.tabs(["📡 Live Stream", "📁 Saved Clips"])
 # ═══════════════════════════════════════════════════════════
 # TAB 1 — Live Stream Feed & Recording Monitor
 # ═══════════════════════════════════════════════════════════
-with tab_live:
+@st.fragment(run_every=0.2 if is_recording else 1)
+def render_live_stream():
     with md.state["lock"]:
         running    = md.state["running"]
         recording  = md.state["recording"]
-        start_time = md.state["start_time"]
+
+    if (running, recording, md.is_finalizing()) != (is_running, is_recording, is_finalizing):
+        st.rerun()
 
     if not running:
         st.info("👆 Select your source in the sidebar and click **▶️ Start** to begin streaming and recording.")
+    elif not recording:
+        st.info("Connecting to stream...")
     else:
-        elapsed = max(0, int(time.time() - start_time)) if start_time else 0
-        mins, secs = divmod(elapsed, 60)
-
-        badge_placeholder = st.empty()
-        badge_placeholder.error(f"🔴 RECORDING IN PROGRESS &nbsp;·&nbsp; ⏱️ Elapsed: {mins:02d}:{secs:02d}")
-
-        feed_placeholder = st.empty()
         frame_bytes = md.get_frame_jpeg()
         if frame_bytes:
-            feed_placeholder.image(frame_bytes, channels="BGR",
-                                   caption="Live Feed (RTSP / Camera)", use_column_width=True)
-        else:
-            feed_placeholder.info("Connecting to stream...")
+            jpeg = base64.b64encode(frame_bytes).decode("ascii")
+            st.html(f'<span id="live-camera-frame" data-jpeg="{jpeg}" hidden></span>')
 
-        # Auto-refresh every second while active
-        time.sleep(1)
-        st.rerun()
+with tab_live:
+    if is_running and is_recording:
+        live_preview(elapsed_seconds=max(0, time.time() - recording_started_at), key="live-camera-preview")
+    render_live_stream()
 
 
 # ═══════════════════════════════════════════════════════════
@@ -193,9 +201,12 @@ with tab_clips:
                     cols[4].markdown(f"{size_mb:.1f} MB")
 
                     if cols[5].button("🗑️", key=f"del_{clip['clip_id']}", help="Delete this clip"):
-                        db.delete_clip(clip["clip_id"])
-                        st.success(f"Deleted: {clip['file_name']}")
-                        st.rerun()
+                        try:
+                            db.delete_clip(clip["clip_id"])
+                        except OSError as exc:
+                            st.error(f"Could not delete {clip['file_name']}. {exc}. You can retry Delete.")
+                        else:
+                            st.rerun()
 
                     # Toggle video player via session_state
                     play_key = f"play_{clip['clip_id']}"

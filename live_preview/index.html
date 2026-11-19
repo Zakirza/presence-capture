@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Live camera preview</title>
+<style>
+  body { margin: 0; }
+  canvas { display: block; width: 100%; height: auto; }
+  #status { margin-bottom: 0.5rem; padding: 0.75rem; border-radius: 0.5rem;
+    background: #fff0f0; color: #832121; font: 600 1rem system-ui, sans-serif; }
+  #elapsed { font-variant-numeric: tabular-nums; }
+</style>
+<div id="status">🔴 RECORDING IN PROGRESS · Elapsed <span id="elapsed"></span></div>
+<canvas id="preview" role="img" aria-label="Live camera feed"></canvas>
+<script>
+  const preview = document.getElementById("preview");
+  const context = preview.getContext("2d");
+  const elapsed = document.getElementById("elapsed");
+  let startedAt;
+  function updateTimer() {
+    if (startedAt === undefined) return;
+    const seconds = Math.max(0, Math.floor((performance.now() - startedAt) / 1000));
+    const label = [Math.floor(seconds / 60), seconds % 60]
+      .map(value => String(value).padStart(2, "0")).join(":");
+    if (elapsed.textContent !== label) elapsed.textContent = label;
+  }
+  window.addEventListener("message", event => {
+    if (event.source !== window.parent || event.data?.type !== "streamlit:render") return;
+    const seconds = event.data.args?.elapsed_seconds;
+    if (startedAt === undefined && Number.isFinite(seconds)) {
+      startedAt = performance.now() - seconds * 1000;
+      updateTimer();
+    }
+  });
+  const timer = setInterval(updateTimer, 250);
+  let latestFrame;
+  let decoding = false;
+  let reportedHeight = -1;
+
+  function send(type, fields = {}) {
+    window.parent.postMessage({ isStreamlitMessage: true, type, ...fields }, "*");
+  }
+
+  new ResizeObserver(() => {
+    const height = Math.ceil(document.body.getBoundingClientRect().height);
+    if (height !== reportedHeight) {
+      reportedHeight = height;
+      send("streamlit:setFrameHeight", { height });
+    }
+  }).observe(document.body);
+
+  async function updateFrame() {
+    const jpeg = window.parent.document.getElementById("live-camera-frame")?.dataset.jpeg;
+    if (decoding || !jpeg || jpeg === latestFrame) {
+      return;
+    }
+    latestFrame = jpeg;
+    decoding = true;
+
+    const nextFrame = new Image();
+    nextFrame.src = "data:image/jpeg;base64," + jpeg;
+    try {
+      await nextFrame.decode();
+      if (preview.width !== nextFrame.naturalWidth || preview.height !== nextFrame.naturalHeight) {
+        preview.width = nextFrame.naturalWidth;
+        preview.height = nextFrame.naturalHeight;
+      }
+      context.drawImage(nextFrame, 0, 0);
+    } catch {
+      // Keep the previous image if this JPEG is incomplete.
+    } finally {
+      decoding = false;
+      // Pick up the newest frame that arrived while this one was decoding.
+      updateFrame();
+    }
+  }
+
+  const frames = new MutationObserver(updateFrame);
+  frames.observe(window.parent.document.getElementById("root"), {
+    subtree: true, childList: true, attributes: true, attributeFilter: ["data-jpeg"],
+  });
+  window.addEventListener("pagehide", () => {
+    frames.disconnect();
+    clearInterval(timer);
+  }, { once: true });
+  send("streamlit:componentReady", { apiVersion: 1 });
+  updateFrame();
+</script>
+</html>

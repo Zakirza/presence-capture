@@ -13,6 +13,7 @@ FIFO Rule:
 
 import os
 import sqlite3
+from contextlib import closing
 from datetime import datetime
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -40,6 +41,10 @@ def init_db():
             detected_at DATETIME NOT NULL,
             ended_at    DATETIME,
             status      TEXT DEFAULT 'saved'
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_file_deletions (
+            path TEXT PRIMARY KEY
         );
 
         CREATE TABLE IF NOT EXISTS video_clips (
@@ -72,6 +77,7 @@ def init_db():
 
     conn.commit()
     conn.close()
+    _retry_file_deletions()
 
 
 def _get_distinct_days(cursor):
@@ -83,26 +89,36 @@ def _get_distinct_days(cursor):
 
 
 def _delete_day(cursor, day: str):
-    """
-    Delete ALL clips (files + DB rows) belonging to `day` (YYYY-MM-DD).
-    Also removes the linked motion_event rows.
-    """
+    """Retire a day and queue its files in the same transaction."""
     rows = cursor.execute(
         "SELECT clip_id, file_path, thumbnail_path, event_id FROM video_clips WHERE clip_date = ?",
         (day,)
     ).fetchall()
-
+    paths = set()
     for row in rows:
-        # Delete DB rows
-        cursor.execute("DELETE FROM video_clips   WHERE clip_id  = ?", (row["clip_id"],))
+        cursor.execute("DELETE FROM video_clips WHERE clip_id = ?", (row["clip_id"],))
         cursor.execute("DELETE FROM motion_events WHERE event_id = ?", (row["event_id"],))
-        # Delete files from disk
-        for path in [row["file_path"], row["thumbnail_path"]]:
-            if path and os.path.exists(path):
-                os.remove(path)
-                print(f"🗑️  Deleted: {path}")
+        paths.update(
+            os.path.normpath(os.path.join(BASE_DIR, path))
+            for path in (row["file_path"], row["thumbnail_path"])
+            if path
+        )
+    cursor.executemany("INSERT OR IGNORE INTO pending_file_deletions VALUES (?)",
+                       ((path,) for path in paths))
 
-    print(f"📅 Purged all clips for day: {day}")
+
+def _retry_file_deletions():
+    with closing(get_connection()) as conn, conn:
+        paths = conn.execute("SELECT path FROM pending_file_deletions").fetchall()
+        for row in paths:
+            path = row["path"]
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                continue  # Keep locked files queued across saves and restarts.
+            conn.execute("DELETE FROM pending_file_deletions WHERE path = ?", (path,))
 
 
 def get_clip_count():
@@ -123,51 +139,39 @@ def get_day_count():
     return count
 
 
-def save_clip_fifo(file_name, file_path, thumbnail_path, duration, size_kb):
-    """
-    Day-based FIFO insert:
-      1. Find how many distinct days are stored.
-      2. If today is already one of those days  → just insert (no deletion).
-      3. If today is a NEW day AND days == MAX_DAYS
-           → delete ALL clips of the OLDEST day
-           → then insert new clip.
-    Returns the new clip_id.
-    """
-    conn   = get_connection()
-    cursor = conn.cursor()
-    now    = datetime.now()
-    today  = now.strftime("%Y-%m-%d")     # e.g. "2026-11-16"
+def save_clip_fifo(file_name, file_path, thumbnail_path, duration, size_kb, recorded_at=None):
+    """Save a clip and prune the oldest stored date when the archive is full."""
+    recorded_at = recorded_at or datetime.now()
+    clip_date = recorded_at.date().isoformat()
 
-    days = _get_distinct_days(cursor)     # oldest → newest
+    with closing(get_connection()) as conn, conn:
+        # Serialize the date check with the insert and pruning.
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.cursor()
+        other_days = [day for day in _get_distinct_days(cursor) if day != clip_date]
+        excess = max(0, len(other_days) + 1 - MAX_DAYS)
+        for day in other_days[:excess]:
+            _delete_day(cursor, day)
 
-    # Today is a brand-new day AND we're already at the limit
-    if today not in days and len(days) >= MAX_DAYS:
-        oldest_day = days[0]              # e.g. "2026-10-17"
-        print(f"⚠️  Day limit reached ({MAX_DAYS}). Removing oldest day: {oldest_day}")
-        _delete_day(cursor, oldest_day)
+        cursor.execute(
+            "INSERT INTO motion_events (detected_at, status) VALUES (?, 'saved')",
+            (recorded_at,)
+        )
+        cursor.execute("""
+            INSERT INTO video_clips
+                (event_id, file_name, file_path, thumbnail_path,
+                 duration_seconds, file_size_kb, recorded_at, clip_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            cursor.lastrowid, file_name, os.path.abspath(file_path),
+            os.path.abspath(thumbnail_path) if thumbnail_path else "",
+            duration, size_kb, recorded_at, clip_date,
+        ))
+        new_clip_id = cursor.lastrowid
 
-    # Insert motion event
-    cursor.execute(
-        "INSERT INTO motion_events (detected_at, status) VALUES (?, 'saved')",
-        (now,)
-    )
-    event_id = cursor.lastrowid
+    # A failed insert or commit leaves all existing footage on disk.
+    _retry_file_deletions()
 
-    # Insert clip
-    file_path = os.path.abspath(file_path)
-    thumbnail_path = os.path.abspath(thumbnail_path) if thumbnail_path else ""
-
-    cursor.execute("""
-        INSERT INTO video_clips
-            (event_id, file_name, file_path, thumbnail_path,
-             duration_seconds, file_size_kb, recorded_at, clip_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (event_id, file_name, file_path, thumbnail_path,
-          duration, size_kb, now, today))
-
-    conn.commit()
-    new_clip_id = cursor.lastrowid
-    conn.close()
     return new_clip_id
 
 
@@ -207,19 +211,21 @@ def get_clips_by_day():
 
 def delete_clip(clip_id):
     """Manually delete a single clip."""
-    conn   = get_connection()
-    cursor = conn.cursor()
+    with closing(get_connection()) as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT file_path, thumbnail_path, event_id FROM video_clips WHERE clip_id = ?",
+            (clip_id,),
+        ).fetchone()
+        if row is None:
+            return
 
-    row = cursor.execute(
-        "SELECT file_path, thumbnail_path, event_id FROM video_clips WHERE clip_id = ?",
-        (clip_id,)
-    ).fetchone()
-
-    if row:
-        cursor.execute("DELETE FROM video_clips   WHERE clip_id  = ?", (clip_id,))
-        cursor.execute("DELETE FROM motion_events WHERE event_id = ?", (row["event_id"],))
-        conn.commit()
-        for path in [row["file_path"], row["thumbnail_path"]]:
-            if path and os.path.exists(path):
-                os.remove(path)
-    conn.close()
+        # Keep the index entry until both files are gone so deletion can be retried.
+        for path in (row["thumbnail_path"], row["file_path"]):
+            if path:
+                try:
+                    os.remove(os.path.join(BASE_DIR, path))
+                except FileNotFoundError:
+                    pass
+        conn.execute("DELETE FROM video_clips WHERE clip_id = ?", (clip_id,))
+        conn.execute("DELETE FROM motion_events WHERE event_id = ?", (row["event_id"],))
